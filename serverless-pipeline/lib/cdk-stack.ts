@@ -41,9 +41,15 @@ export class CdkStack extends cdk.Stack {
     });
 
     // ---- SQS ----
+    const deadLetterQueue = new sqs.Queue(this, 'JobsDeadLetterQueue', {
+      queueName: 'jobs-dlq',
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     const queue = new sqs.Queue(this, 'JobsQueue', {
       queueName: 'jobs-queue',
       visibilityTimeout: cdk.Duration.seconds(30),
+      deadLetterQueue: { queue: deadLetterQueue, maxReceiveCount: 3 },
     });
 
     // S3 triggers SQS when a file is uploaded
@@ -67,7 +73,9 @@ export class CdkStack extends cdk.Stack {
     // Grant permissions
     table.grantWriteData(processorFn);
     topic.grantPublish(processorFn);
-    processorFn.addEventSource(new lambda_event_sources.SqsEventSource(queue));
+    processorFn.addEventSource(new lambda_event_sources.SqsEventSource(queue, {
+      reportBatchItemFailures: true,
+    }));
 
     // ---- Lambda: hello ----
     const helloFn = new nodejs.NodejsFunction(this, 'HelloFunction', {
@@ -107,6 +115,7 @@ export class CdkStack extends cdk.Stack {
     // ---- Outputs ----
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'QueueUrl', { value: queue.queueUrl });
+    new cdk.CfnOutput(this, 'DeadLetterQueueArn', { value: deadLetterQueue.queueArn });
     new cdk.CfnOutput(this, 'TopicArn', { value: topic.topicArn });
     new cdk.CfnOutput(this, 'TableName', { value: table.tableName });
     new cdk.CfnOutput(this, 'ApiUrl', { value: api.url });

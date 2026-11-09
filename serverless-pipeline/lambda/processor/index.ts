@@ -1,36 +1,61 @@
 import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
-import { randomUUID } from 'crypto';
 
 const dynamo = new DynamoDBClient({});
 const sns = new SNSClient({});
 
-export const handler = async (event: any) => {
+interface SqsRecord {
+  messageId: string;
+  body: string;
+}
+
+// One JSON object per line so CloudWatch Logs Insights can query fields directly.
+function log(level: 'INFO' | 'ERROR', message: string, fields: Record<string, unknown> = {}) {
+  process.stdout.write(`${JSON.stringify({ level, message, ...fields })}\n`);
+}
+
+export const handler = async (event: { Records: SqsRecord[] }) => {
+  const batchItemFailures: { itemIdentifier: string }[] = [];
+
   for (const record of event.Records) {
-    const body = JSON.parse(record.body);
-    const s3Event = body.Records?.[0];
+    // The SQS message id is stable across retries, so a retried message
+    // overwrites its own job record instead of creating a duplicate.
+    const jobId = record.messageId;
+    let fileKey = 'unknown';
 
-    const jobId = randomUUID();
-    const key = s3Event?.s3?.object?.key || 'unknown';
+    try {
+      const body = JSON.parse(record.body);
+      fileKey = body.Records?.[0]?.s3?.object?.key || 'unknown';
 
-    // Save to DynamoDB
-    await dynamo.send(new PutItemCommand({
-      TableName: process.env.TABLE_NAME!,
-      Item: {
-        jobId: { S: jobId },
-        fileKey: { S: key },
-        status: { S: 'processed' },
-        createdAt: { S: new Date().toISOString() },
-      },
-    }));
+      await dynamo.send(new PutItemCommand({
+        TableName: process.env.TABLE_NAME!,
+        Item: {
+          jobId: { S: jobId },
+          fileKey: { S: fileKey },
+          status: { S: 'processed' },
+          createdAt: { S: new Date().toISOString() },
+        },
+      }));
 
-    // Notify via SNS
-    await sns.send(new PublishCommand({
-      TopicArn: process.env.TOPIC_ARN!,
-      Message: `Job ${jobId} processed file: ${key}`,
-      Subject: 'Job Complete',
-    }));
+      await sns.send(new PublishCommand({
+        TopicArn: process.env.TOPIC_ARN!,
+        Message: `Job ${jobId} processed file: ${fileKey}`,
+        Subject: 'Job Complete',
+      }));
 
-    console.log(`Processed job ${jobId} for file ${key}`);
+      log('INFO', 'Job processed', { jobId, fileKey });
+    } catch (err) {
+      const error = err as Error;
+      log('ERROR', 'Job processing failed', {
+        jobId,
+        fileKey,
+        errorName: error.name,
+        errorMessage: error.message,
+      });
+      // Only this message is retried (and eventually dead-lettered), not the whole batch.
+      batchItemFailures.push({ itemIdentifier: record.messageId });
+    }
   }
+
+  return { batchItemFailures };
 };
