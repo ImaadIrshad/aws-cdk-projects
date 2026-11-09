@@ -9,6 +9,9 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sns_subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as lambda_event_sources from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cw_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import { Construct } from 'constructs';
 
 export class CdkStack extends cdk.Stack {
@@ -112,11 +115,74 @@ export class CdkStack extends cdk.Stack {
     const jobs = api.root.addResource('jobs');
     jobs.addResource('{jobId}').addMethod('GET', new apigateway.LambdaIntegration(statusFn));
 
+    // ---- Alerts ----
+    const alertsTopic = new sns.Topic(this, 'AlertsTopic', {
+      topicName: 'pipeline-alerts',
+    });
+
+    // Optional: cdk deploy -c alertEmail=you@example.com
+    const alertEmail = this.node.tryGetContext('alertEmail');
+    if (alertEmail) {
+      alertsTopic.addSubscription(new sns_subs.EmailSubscription(alertEmail));
+    }
+
+    // The processor catches errors per record, so the Lambda `Errors` metric
+    // stays at zero for them. Count the ERROR log lines instead.
+    const processingErrorsFilter = new logs.MetricFilter(this, 'ProcessingErrorsFilter', {
+      logGroup: processorFn.logGroup,
+      metricNamespace: 'JobsPipeline',
+      metricName: 'ProcessingErrors',
+      filterPattern: logs.FilterPattern.stringValue('$.level', '=', 'ERROR'),
+      metricValue: '1',
+    });
+
+    const alarmDefaults = {
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    };
+
+    const alarms = [
+      new cloudwatch.Alarm(this, 'ProcessingErrorsAlarm', {
+        ...alarmDefaults,
+        alarmDescription: 'The processor logged at least one failed job',
+        metric: new cloudwatch.Metric({
+          namespace: 'JobsPipeline',
+          metricName: 'ProcessingErrors',
+          statistic: 'Sum',
+          period: cdk.Duration.minutes(5),
+        }),
+      }),
+      new cloudwatch.Alarm(this, 'DeadLetterQueueAlarm', {
+        ...alarmDefaults,
+        alarmDescription: 'A job exhausted its retries and is waiting in jobs-dlq',
+        metric: deadLetterQueue.metricApproximateNumberOfMessagesVisible({
+          statistic: 'Maximum',
+          period: cdk.Duration.minutes(1),
+        }),
+      }),
+      new cloudwatch.Alarm(this, 'ProcessorCrashAlarm', {
+        ...alarmDefaults,
+        alarmDescription: 'The processor invocation itself failed (timeout, out of memory, crash)',
+        metric: processorFn.metricErrors({ period: cdk.Duration.minutes(5) }),
+      }),
+      new cloudwatch.Alarm(this, 'ApiServerErrorAlarm', {
+        ...alarmDefaults,
+        alarmDescription: 'The API returned at least one 5xx response',
+        metric: api.metricServerError({ period: cdk.Duration.minutes(5) }),
+      }),
+    ];
+
+    const alarmAction = new cw_actions.SnsAction(alertsTopic);
+    alarms.forEach((alarm) => alarm.addAlarmAction(alarmAction));
+
     // ---- Outputs ----
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'QueueUrl', { value: queue.queueUrl });
     new cdk.CfnOutput(this, 'DeadLetterQueueArn', { value: deadLetterQueue.queueArn });
     new cdk.CfnOutput(this, 'TopicArn', { value: topic.topicArn });
+    new cdk.CfnOutput(this, 'AlertsTopicArn', { value: alertsTopic.topicArn });
     new cdk.CfnOutput(this, 'TableName', { value: table.tableName });
     new cdk.CfnOutput(this, 'ApiUrl', { value: api.url });
   }
